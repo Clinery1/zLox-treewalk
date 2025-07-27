@@ -1,5 +1,6 @@
 # Completed chapters
 - Chapter 4: Scanning
+- Chapter 5: Representing Code
 
 # Description
 This is zLox! A Zig-based implementation of

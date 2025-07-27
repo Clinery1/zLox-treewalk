@@ -24,6 +24,33 @@ pub fn main() !u8 {
     }
 }
 
+fn testPrintAst(ctx: *RunContext) !void {
+    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    const literal123 = try alloc.create(ast.Expr);
+    literal123.* = .{ .literal = .{ .number = 123 } };
+
+    const unary = try alloc.create(ast.Expr);
+    unary.* = .{ .unary = .{ .operator = token.Token.init(.MINUS, "-", null, 1), .right = literal123 } };
+
+    const literal4567 = try alloc.create(ast.Expr);
+    literal4567.* = .{ .literal = .{ .number = 45.67 } };
+    const grouping = try alloc.create(ast.Expr);
+    grouping.* = .{ .grouping = literal4567 };
+
+    const binary = ast.Expr{
+        .binary = .{
+            .left = unary,
+            .operator = token.Token.init(.STAR, "*", null, 1),
+            .right = grouping,
+        },
+    };
+
+    try ctx.stdout.writer().print("{s}\n", .{binary});
+}
+
 fn runPrompt() !u8 {
     var gp_alloc = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gp_alloc.deinit();
@@ -36,6 +63,8 @@ fn runPrompt() !u8 {
         .alloc = gp_alloc.allocator(),
         .had_error = false,
     };
+
+    try testPrintAst(&ctx);
 
     var line_buf = std.ArrayList(u8).init(ctx.alloc);
     defer line_buf.deinit();
@@ -123,4 +152,5 @@ pub const RunContext = struct {
 };
 
 const std = @import("std");
-const token = @import("token.zig");
+pub const token = @import("token.zig");
+pub const ast = @import("ast.zig");
