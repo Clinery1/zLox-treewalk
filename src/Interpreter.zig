@@ -49,13 +49,14 @@ pub const ErrorDescription = struct {
 
 ctx: *root.RunContext,
 error_desc: ?ErrorDescription,
+expr_arena: std.heap.ArenaAllocator,
 
 pub fn init(ctx: *root.RunContext) Interpreter {
     return .{ .ctx = ctx, .error_desc = null };
 }
 
 pub fn interpret(self: *Interpreter, expr: *Ast.Expr) !Value {
-    return self.evaluateExpr(expr);
+    return self.evaluateExprInner(expr);
 }
 
 pub fn printError(self: *Interpreter) !void {
@@ -105,6 +106,29 @@ fn logError(self: *Interpreter, ty: Error, value: ?Value, token: ?Scanner.Token)
     self.error_desc = .{ .ty = ty, .value = value, .token = token };
 }
 
+fn allocValue(self: *Interpreter, val: Value) !*Value {
+    const ptr = try self.ctx.alloc.create(Value);
+    ptr.* = val;
+    return ptr;
+}
+
+/// If the value has an allocation, then it reallocates it in the program allocator. This bypasses
+/// the resetting of the expression allocator
+fn reallocValue(self: *Interpreter, val: Value) !Value {
+    if (std.meta.activeTag(val) == .string) {
+        const ptr = self.allocString(val.string);
+        return .{ .string = ptr };
+    } else {
+        return val;
+    }
+}
+
+fn exprAllocString(self: *Interpreter, string: []const u8) ![]u8 {
+    const ptr = try self.expr_arena.allocator().alloc(u8, string.len);
+    std.mem.copyForwards(u8, ptr, string);
+    return ptr;
+}
+
 fn allocString(self: *Interpreter, string: []const u8) ![]u8 {
     const ptr = try self.ctx.alloc.alloc(u8, string.len);
     std.mem.copyForwards(u8, ptr, string);
@@ -112,6 +136,13 @@ fn allocString(self: *Interpreter, string: []const u8) ![]u8 {
 }
 
 fn evaluateExpr(self: *Interpreter, expr_param: *Ast.Expr) LoxAllocError!Value {
+    const expr = try self.evaluateExprInner(expr_param);
+    const realloc = try self.reallocValue(expr);
+    _ = self.expr_arena.reset(.retain_capacity);
+    return realloc;
+}
+
+fn evaluateExprInner(self: *Interpreter, expr_param: *Ast.Expr) LoxAllocError!Value {
     var expr = expr_param;
     while (true) {
         switch (expr.*) {
@@ -126,7 +157,7 @@ fn evaluateExpr(self: *Interpreter, expr_param: *Ast.Expr) LoxAllocError!Value {
 
 fn unaryExpr(self: *Interpreter, expr: *Ast.Expr) !Value {
     const unary = expr.unary;
-    const right = try self.evaluateExpr(unary.right);
+    const right = try self.evaluateExprInner(unary.right);
 
     switch (unary.operator.ty) {
         .MINUS => {
@@ -150,7 +181,7 @@ fn literalExpr(self: *Interpreter, lit: *Ast.Expr) !Value {
         .boolean => |val| return .{ .boolean = val },
         .number => |val| return .{ .number = val },
         .string => |val| {
-            const str = try self.allocString(val);
+            const str = try self.exprAllocString(val);
             return .{ .string = str };
         },
         else => unreachable,
@@ -178,8 +209,8 @@ inline fn tryCast(comptime ty: ValueType, val: Value) ?@FieldType(Value, @tagNam
 
 fn binaryExpr(self: *Interpreter, expr: *Ast.Expr) !Value {
     const binary = expr.binary;
-    const left_val = try self.evaluateExpr(binary.left);
-    const right_val = try self.evaluateExpr(binary.right);
+    const left_val = try self.evaluateExprInner(binary.left);
+    const right_val = try self.evaluateExprInner(binary.right);
 
     switch (binary.operator.ty) {
         .MINUS => {
@@ -211,9 +242,9 @@ fn binaryExpr(self: *Interpreter, expr: *Ast.Expr) !Value {
                 const right = try self.cast(.string, right_val, binary.operator);
                 const slices = .{ left, right };
 
-                const both = try std.mem.concat(self.ctx.alloc, u8, &slices);
-                self.ctx.alloc.free(right);
-                self.ctx.alloc.free(left);
+                const both = try std.mem.concat(self.expr_arena.allocator(), u8, &slices);
+                // We don't need to deallocate memory because we either had a global value or a
+                // temporary Arena allocated string
 
                 return .{ .string = both };
             }
