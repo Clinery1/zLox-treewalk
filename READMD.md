@@ -1,6 +1,8 @@
 # Completed chapters
 - Chapter 4: Scanning
 - Chapter 5: Representing Code
+- Chapter 6: Parsing Expressions
+- Chapter 7: Evaluating Expressions
 
 # Description
 This is zLox! A Zig-based implementation of
@@ -22,5 +24,7 @@ some of the stuff like parsing.
 - Keyword lexing iterates through a list of strings and compares them instead of allocating a whole
     hash map just for keyword detection.
 - The AST is represented slightly differently, but as close as possible.
-- Parsing uses recursive ascent (my favorite) instead of the recursive descent of the book.
+- Parsing uses a combination of recursive ascent (my favorite) and recursive descent to eliminate back tracking.
 - Anything with the visitor pattern doesn't exist. We can just switch on a tagged union instead.
+- The interpreter has to handle memory allocation/deallocation, so I make it explicit what happens
+    there.

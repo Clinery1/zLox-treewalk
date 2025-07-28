@@ -24,33 +24,6 @@ pub fn main() !u8 {
     }
 }
 
-fn testPrintAst(ctx: *RunContext) !void {
-    var arena = std.heap.ArenaAllocator.init(ctx.alloc);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-
-    const literal123 = try alloc.create(ast.Expr);
-    literal123.* = .{ .literal = .{ .number = 123 } };
-
-    const unary = try alloc.create(ast.Expr);
-    unary.* = .{ .unary = .{ .operator = token.Token.init(.MINUS, "-", null, 1), .right = literal123 } };
-
-    const literal4567 = try alloc.create(ast.Expr);
-    literal4567.* = .{ .literal = .{ .number = 45.67 } };
-    const grouping = try alloc.create(ast.Expr);
-    grouping.* = .{ .grouping = literal4567 };
-
-    const binary = ast.Expr{
-        .binary = .{
-            .left = unary,
-            .operator = token.Token.init(.STAR, "*", null, 1),
-            .right = grouping,
-        },
-    };
-
-    try ctx.stdout.writer().print("{s}\n", .{binary});
-}
-
 fn runPrompt() !u8 {
     var gp_alloc = std.heap.GeneralPurposeAllocator(.{}).init;
     defer _ = gp_alloc.deinit();
@@ -61,10 +34,7 @@ fn runPrompt() !u8 {
         .stdout = stdout,
         .stdin = stdin,
         .alloc = gp_alloc.allocator(),
-        .had_error = false,
     };
-
-    try testPrintAst(&ctx);
 
     var line_buf = std.ArrayList(u8).init(ctx.alloc);
     defer line_buf.deinit();
@@ -78,9 +48,15 @@ fn runPrompt() !u8 {
             },
         };
 
-        try run(&ctx, line_buf.items);
-        ctx.had_error = false;
+        const val = run(&ctx, line_buf.items) catch |err| switch (err) {
+            error.LoxError => continue,
+            else => return err,
+        };
+
+        try ctx.stdout.writer().print("{s}\n", .{val});
+        val.deinit(&ctx);
     }
+
     try ctx.stdout.writeAll("\n");
     return 0;
 }
@@ -95,40 +71,64 @@ fn runFile(path: []const u8) !u8 {
         .stdout = stdout,
         .stdin = std.io.getStdIn(),
         .alloc = gp_alloc.allocator(),
-        .had_error = false,
     };
 
     var cwd = std.fs.cwd();
     const contents = try cwd.readFileAlloc(ctx.alloc, path, MAX_FILE_SIZE);
     defer ctx.alloc.destroy(&contents);
 
-    run(&ctx, contents) catch |err| {
-        try writer.print("Error running file: {any}", .{err});
-        return 1;
+    const val = run(&ctx, contents) catch |err| switch (err) {
+        error.LoxError => return 65,
+        else => {
+            try writer.print("Error running file: {any}", .{err});
+            return 1;
+        },
     };
-
-    if (ctx.had_error) {
-        return 65;
-    }
+    val.deinit(&ctx);
 
     return 0;
 }
 
-fn run(ctx: *RunContext, source: []const u8) !void {
-    var scanner = try token.Scanner.init(ctx, source);
-    const tokens = try scanner.scanTokens();
-    defer tokens.deinit();
+fn run(ctx: *RunContext, source: []const u8) !Interpreter.Value {
+    var s = try Scanner.init(ctx, source);
+    const tokens = try s.scanTokens();
 
-    const writer = ctx.stdout.writer();
-    var line: u32 = 9999; // some arbitrary number that isn't 0 or 1
-
-    for (tokens.items) |tok| {
-        if (line != tok.line) {
-            line = tok.line;
-            try writer.print("\nLine {}\n", .{line});
+    const ast_arena, const ast_value = parse: {
+        var parser = Parser.init(ctx, tokens);
+        errdefer {
+            const arena = parser.deinit();
+            arena.deinit();
         }
-        try writer.print("{s}\n", .{tok});
-    }
+
+        const ast_inner = parser.parse() catch |err| {
+            switch (err) {
+                error.LoxError => {
+                    try parser.printErrors();
+                    return error.LoxError;
+                },
+                else => return err,
+            }
+        };
+
+        break :parse .{ parser.deinit(), ast_inner };
+    };
+    defer ast_arena.deinit();
+
+    // NOTE: Debug print the AST
+    try ctx.stdout.writer().print("{s}\n", .{ast_value});
+
+    var interpreter = Interpreter.init(ctx);
+    const ret = interpreter.interpret(ast_value) catch |err| {
+        switch (err) {
+            error.LoxError => {
+                try interpreter.printError();
+                return error.LoxError;
+            },
+            else => return err,
+        }
+    };
+
+    return ret;
 }
 
 fn readLine(reader: anytype, buf: *std.ArrayList(u8)) !void {
@@ -140,17 +140,25 @@ pub fn report(ctx: *RunContext, line: u32, comptime msg: []const u8, args: anyty
     const writer = ctx.stdout.writer();
     try writer.print("[{}] Error: ", .{line});
     try writer.print(msg, args);
-
-    ctx.had_error = true;
+}
+/// Never returns
+pub inline fn todo(comptime msg: []const u8, args: anytype) noreturn {
+    std.debug.print("TODO: ", .{});
+    std.debug.print(msg, args);
+    unreachable; // Not implemented
 }
 
 pub const RunContext = struct {
     stdout: std.fs.File,
     stdin: std.fs.File,
     alloc: std.mem.Allocator,
-    had_error: bool,
 };
 
+pub const LoxAllocError = std.mem.Allocator.Error || error{LoxError};
+
 const std = @import("std");
-pub const token = @import("token.zig");
-pub const ast = @import("ast.zig");
+
+pub const Scanner = @import("Scanner.zig");
+pub const Ast = @import("Ast.zig");
+pub const Parser = @import("Parser.zig");
+pub const Interpreter = @import("Interpreter.zig");

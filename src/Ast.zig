@@ -1,15 +1,19 @@
 pub const Expr = union(enum) {
     binary: struct {
         left: *Expr,
-        operator: root.token.Token,
+        operator: Scanner.Token,
         right: *Expr,
     },
     unary: struct {
-        operator: root.token.Token,
+        operator: Scanner.Token,
         right: *Expr,
     },
     grouping: *Expr,
-    literal: root.token.Literal,
+
+    number: f64,
+    string: []const u8,
+    boolean: bool,
+    nil,
 
     pub fn format(
         self: @This(),
@@ -35,10 +39,15 @@ pub const Expr = union(enum) {
                 try grouping.format(fmt, options, writer);
                 try writer.writeAll(")");
             },
-            .literal => |literal| return literal.format(fmt, options, writer),
+            .number => |number| try writer.print("{d}", .{number}),
+            .string => |string| try writer.print("\"{s}\"", .{string}),
+            .boolean => |boolean| try writer.print("{}", .{boolean}),
+            .nil => try writer.writeAll("nil"),
         }
     }
 };
 
 const root = @import("root");
 const std = @import("std");
+
+const Scanner = root.Scanner;
