@@ -11,10 +11,15 @@ This is zLox! A Zig-based implementation of
 tree-walking Lox language. As such, there are a few concepts that just don't carry over from Java to
 Zig, so I am going to take my own spin on them.
 
+# Disclaimer
 This is my first real project in Zig, so I am still learning a lot of things.
+
+DO NOT TAKE THIS AS "GOOD" CODE! You have been warned!
 
 I try to stay mostly faithful to the book with naming, functions, etc., but I put my own spin on
 some of the stuff like parsing.
+
+The memory is manually managed, so may have leaks/bugs (I already found and fixed one).
 
 
 ## A note about managing memory
