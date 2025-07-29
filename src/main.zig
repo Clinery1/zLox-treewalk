@@ -9,7 +9,7 @@ pub fn main() !u8 {
         stdout.writeAll("Usage: zlog [script]\n") catch {};
         return 64;
     } else if (std.os.argv.len == 2) {
-        const ptr = std.mem.span(std.os.argv[0]);
+        const ptr = std.mem.span(std.os.argv[1]);
         const code = runFile(ptr) catch |err| {
             stdout.writer().print("Error running file: {any}", .{err}) catch {};
             return 65;
@@ -38,6 +38,8 @@ fn runPrompt() !u8 {
 
     var line_buf = std.ArrayList(u8).init(ctx.alloc);
     defer line_buf.deinit();
+    var interpreter = try Interpreter.init(&ctx);
+    defer interpreter.deinit();
 
     while (true) {
         try ctx.stdout.writeAll("> ");
@@ -48,13 +50,10 @@ fn runPrompt() !u8 {
             },
         };
 
-        const val = run(&ctx, line_buf.items) catch |err| switch (err) {
+        interpreter = run(&ctx, line_buf.items, interpreter) catch |err| switch (err) {
             error.LoxError => continue,
             else => return err,
         };
-
-        try ctx.stdout.writer().print("{s}\n", .{val});
-        val.deinit(&ctx);
     }
 
     try ctx.stdout.writeAll("\n");
@@ -75,25 +74,30 @@ fn runFile(path: []const u8) !u8 {
 
     var cwd = std.fs.cwd();
     const contents = try cwd.readFileAlloc(ctx.alloc, path, MAX_FILE_SIZE);
-    defer ctx.alloc.destroy(&contents);
+    defer ctx.alloc.free(contents);
 
-    const val = run(&ctx, contents) catch |err| switch (err) {
+    var interpreter = run(&ctx, contents, null) catch |err| switch (err) {
         error.LoxError => return 65,
         else => {
             try writer.print("Error running file: {any}", .{err});
             return 1;
         },
     };
-    val.deinit(&ctx);
+    interpreter.deinit();
 
     return 0;
 }
 
-fn run(ctx: *RunContext, source: []const u8) !Interpreter.Value {
+fn run(ctx: *RunContext, source: []const u8, prev_interpreter: ?Interpreter) !Interpreter {
     var s = try Scanner.init(ctx, source);
     const tokens = try s.scanTokens();
 
-    const ast_arena, const ast_value = parse: {
+    // try ctx.stdout.writeAll("Tokens:\n");
+    // for (tokens.items) |token| {
+    //     try ctx.stdout.writer().print("{s}\n", .{token});
+    // }
+
+    const ast_arena, const stmt_list = parse: {
         var parser = Parser.init(ctx, tokens);
         errdefer {
             const arena = parser.deinit();
@@ -115,10 +119,12 @@ fn run(ctx: *RunContext, source: []const u8) !Interpreter.Value {
     defer ast_arena.deinit();
 
     // NOTE: Debug print the AST
-    try ctx.stdout.writer().print("{s}\n", .{ast_value});
+    // for (ast_value.items) |stmt| {
+    //     try ctx.stdout.writer().print("{s}\n", .{stmt});
+    // }
 
-    var interpreter = Interpreter.init(ctx);
-    const ret = interpreter.interpret(ast_value) catch |err| {
+    var interpreter = prev_interpreter orelse try Interpreter.init(ctx);
+    interpreter.interpret(stmt_list.items) catch |err| {
         switch (err) {
             error.LoxError => {
                 try interpreter.printError();
@@ -128,7 +134,7 @@ fn run(ctx: *RunContext, source: []const u8) !Interpreter.Value {
         }
     };
 
-    return ret;
+    return interpreter;
 }
 
 fn readLine(reader: anytype, buf: *std.ArrayList(u8)) !void {

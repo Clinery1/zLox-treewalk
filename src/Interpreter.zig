@@ -10,8 +10,8 @@ pub const Value = union(ValueType) {
     string: []u8,
     nil,
 
-    pub fn deinit(self: @This(), ctx: *root.RunContext) void {
-        switch (self) {
+    pub fn deinit(self: *@This(), ctx: *root.RunContext) void {
+        switch (self.*) {
             .string => |slice| ctx.alloc.free(slice),
             else => {},
         }
@@ -35,28 +35,118 @@ pub const Value = union(ValueType) {
     }
 };
 
+pub const Environment = struct {
+    ctx: *root.RunContext,
+    next: ?*@This(),
+    values: std.StringHashMap(Value),
+
+    pub fn init(ctx: *root.RunContext) !*@This() {
+        const ptr = try ctx.alloc.create(@This());
+        ptr.* = .{
+            .ctx = ctx,
+            .next = null,
+            .values = std.StringHashMap(Value).init(ctx.alloc),
+        };
+        return ptr;
+    }
+
+    pub fn initChild(ctx: *root.RunContext, parent: *@This()) !*@This() {
+        const ptr = try ctx.alloc.create(@This());
+        ptr.* = .{
+            .ctx = ctx,
+            .next = parent,
+            .values = std.StringHashMap(Value).init(ctx.alloc),
+        };
+        return ptr;
+    }
+
+    pub fn deinit(self: *@This()) void {
+        var iter = self.values.iterator();
+        while (iter.next()) |kv| {
+            kv.value_ptr.deinit(self.ctx);
+            self.ctx.alloc.free(kv.key_ptr.*);
+        }
+        self.values.deinit();
+        if (self.next) |next| {
+            next.deinit();
+            self.ctx.alloc.destroy(next);
+        }
+    }
+
+    /// NOTE: Value **must** be allocated by the program allocator, not the Expr Arena. Copies the
+    /// key value to an owned allocation.
+    pub fn define(self: *@This(), string: []const u8, value: Value) !void {
+        const ptr = try self.ctx.alloc.alloc(u8, string.len);
+        std.mem.copyForwards(u8, ptr, string);
+
+        if (self.values.fetchRemove(ptr)) |kv| {
+            self.ctx.alloc.free(kv.key);
+            var val = kv.value;
+            val.deinit(self.ctx);
+        }
+
+        try self.values.put(ptr, value);
+    }
+
+    /// NOTE: Value **must** be allocated by the program allocator, not the Expr Arena. Copies the
+    /// key value to an owned allocation.
+    pub fn assign(self: *@This(), string: []const u8, value: Value) Error!void {
+        if (self.values.getPtr(string)) |stored_val| {
+            stored_val.deinit(self.ctx);
+            stored_val.* = value;
+        } else if (self.next) |next| {
+            return next.assign(string, value);
+        } else {
+            return Error.UndefinedVariable;
+        }
+    }
+
+    /// NOTE: Returns a copy of the internal value. This environment still owns it, so just discard
+    /// the value when finished.
+    pub fn get(self: *@This(), string: []const u8) Error!Value {
+        if (self.values.get(string)) |val| {
+            return val;
+        } else if (self.next) |next| {
+            return next.get(string);
+        }
+        return Error.UndefinedVariable;
+    }
+};
+
 pub const Error = error{
     InvalidTypeCast,
     InvalidAddTypes,
     DivideByZero,
+    UndefinedVariable,
 };
 
 pub const ErrorDescription = struct {
     ty: Error,
-    value: ?Value,
     token: ?Scanner.Token,
 };
 
 ctx: *root.RunContext,
 error_desc: ?ErrorDescription,
 expr_arena: std.heap.ArenaAllocator,
+env: *Environment,
 
-pub fn init(ctx: *root.RunContext) Interpreter {
-    return .{ .ctx = ctx, .error_desc = null };
+pub fn init(ctx: *root.RunContext) !Interpreter {
+    return .{
+        .ctx = ctx,
+        .error_desc = null,
+        .expr_arena = std.heap.ArenaAllocator.init(ctx.alloc),
+        .env = try Environment.init(ctx),
+    };
 }
 
-pub fn interpret(self: *Interpreter, expr: *Ast.Expr) !Value {
-    return self.evaluateExprInner(expr);
+pub fn deinit(self: *Interpreter) void {
+    self.env.deinit();
+    self.ctx.alloc.destroy(self.env);
+    self.expr_arena.deinit();
+}
+
+pub fn interpret(self: *Interpreter, stmts: []const Ast.Stmt) !void {
+    return self.evaluateBlockInner(stmts);
 }
 
 pub fn printError(self: *Interpreter) !void {
@@ -93,17 +183,68 @@ pub fn printError(self: *Interpreter) !void {
                     try writer.writeAll("Divide by zero\n");
                 }
             },
-        }
-
-        if (err.value) |val| {
-            val.deinit(self.ctx);
+            Error.UndefinedVariable => {
+                if (err.token) |token| {
+                    try writer.print(
+                        "[{d}] Variable `{s}` is undefined\n",
+                        .{ token.line, token.lexeme },
+                    );
+                } else {
+                    try writer.writeAll("Variable is undefined\n");
+                }
+            },
         }
     }
     self.error_desc = null;
 }
 
-fn logError(self: *Interpreter, ty: Error, value: ?Value, token: ?Scanner.Token) void {
-    self.error_desc = .{ .ty = ty, .value = value, .token = token };
+fn evaluateBlockInner(self: *Interpreter, stmts: []const Ast.Stmt) !void {
+    for (stmts) |*stmt| {
+        try self.evaluateStatement(stmt);
+    }
+}
+
+fn evaluateStatement(self: *Interpreter, stmt: *const Ast.Stmt) !void {
+    switch (stmt.*) {
+        .print => |expr| {
+            var val = try self.evaluateExpr(expr);
+            try self.ctx.stdout.writer().print("{s}\n", .{val});
+            val.deinit(self.ctx);
+        },
+        .expr => |expr| {
+            var val = try self.evaluateExpr(expr);
+            val.deinit(self.ctx);
+        },
+        .variable => |variable| {
+            var val: Value = .nil;
+            if (variable.init) |var_init| {
+                val = try self.evaluateExpr(var_init);
+            }
+            // std.debug.print("Define var `{s}` with value `{s}`\n", .{ variable.name.lexeme, val });
+            try self.env.define(variable.name.lexeme, val);
+        },
+        .block => |block| {
+            const old_env = self.env;
+            const new_env = try Environment.initChild(self.ctx, old_env);
+            self.env = new_env;
+            // release the environment on success or error. Defer is really nice.
+            defer {
+                self.env = old_env;
+
+                new_env.next = null;
+                new_env.deinit();
+                self.ctx.alloc.destroy(new_env);
+            }
+
+            for (block.items) |*inner_stmt| {
+                try self.evaluateStatement(inner_stmt);
+            }
+        },
+    }
+}
+
+fn logError(self: *Interpreter, ty: Error, token: ?Scanner.Token) void {
+    self.error_desc = .{ .ty = ty, .token = token };
 }
 
 fn allocValue(self: *Interpreter, val: Value) !*Value {
@@ -116,7 +257,7 @@ fn allocValue(self: *Interpreter, val: Value) !*Value {
 /// the resetting of the expression allocator
 fn reallocValue(self: *Interpreter, val: Value) !Value {
     if (std.meta.activeTag(val) == .string) {
-        const ptr = self.allocString(val.string);
+        const ptr = try self.allocString(val.string);
         return .{ .string = ptr };
     } else {
         return val;
@@ -135,27 +276,41 @@ fn allocString(self: *Interpreter, string: []const u8) ![]u8 {
     return ptr;
 }
 
-fn evaluateExpr(self: *Interpreter, expr_param: *Ast.Expr) LoxAllocError!Value {
+/// Returns a value allocated with the program allocator
+pub fn evaluateExpr(self: *Interpreter, expr_param: *const Ast.Expr) LoxAllocError!Value {
     const expr = try self.evaluateExprInner(expr_param);
     const realloc = try self.reallocValue(expr);
     _ = self.expr_arena.reset(.retain_capacity);
     return realloc;
 }
 
-fn evaluateExprInner(self: *Interpreter, expr_param: *Ast.Expr) LoxAllocError!Value {
+fn evaluateExprInner(self: *Interpreter, expr_param: *const Ast.Expr) LoxAllocError!Value {
     var expr = expr_param;
     while (true) {
         switch (expr.*) {
             .binary => return self.binaryExpr(expr),
             .unary => return self.unaryExpr(expr),
+            .assign => return self.assignExpr(expr),
             .grouping => |inner| expr = inner,
 
-            .number, .string, .boolean, .nil => return self.literalExpr(expr),
+            .number, .string, .boolean, .nil, .variable => return self.literalExpr(expr),
         }
     }
 }
 
-fn unaryExpr(self: *Interpreter, expr: *Ast.Expr) !Value {
+fn assignExpr(self: *Interpreter, expr: *const Ast.Expr) !Value {
+    const assign = expr.assign;
+    // This one gives us a program-allocated value that we can use in the environment
+    const value = try self.evaluateExpr(assign.value);
+    self.env.assign(assign.name.lexeme, value) catch |err| {
+        self.logError(err, assign.name);
+        return error.LoxError;
+    };
+
+    return value;
+}
+
+fn unaryExpr(self: *Interpreter, expr: *const Ast.Expr) !Value {
     const unary = expr.unary;
     const right = try self.evaluateExprInner(unary.right);
 
@@ -175,7 +330,7 @@ fn unaryExpr(self: *Interpreter, expr: *Ast.Expr) !Value {
     }
 }
 
-fn literalExpr(self: *Interpreter, lit: *Ast.Expr) !Value {
+fn literalExpr(self: *Interpreter, lit: *const Ast.Expr) !Value {
     switch (lit.*) {
         .nil => return .nil,
         .boolean => |val| return .{ .boolean = val },
@@ -183,6 +338,14 @@ fn literalExpr(self: *Interpreter, lit: *Ast.Expr) !Value {
         .string => |val| {
             const str = try self.exprAllocString(val);
             return .{ .string = str };
+        },
+        .variable => |token| {
+            // std.debug.print("Get variable `{s}`\n", .{token.lexeme});
+            const value = self.env.get(token.lexeme) catch |err| {
+                self.logError(err, token);
+                return error.LoxError;
+            };
+            return value;
         },
         else => unreachable,
     }
@@ -193,7 +356,7 @@ inline fn cast(self: *Interpreter, comptime ty: ValueType, val: Value, token: ?S
     switch (val) {
         ty => |cap| return cap,
         else => {
-            self.logError(Error.InvalidTypeCast, val, token);
+            self.logError(Error.InvalidTypeCast, token);
             return error.LoxError;
         },
     }
@@ -207,7 +370,7 @@ inline fn tryCast(comptime ty: ValueType, val: Value) ?@FieldType(Value, @tagNam
     }
 }
 
-fn binaryExpr(self: *Interpreter, expr: *Ast.Expr) !Value {
+fn binaryExpr(self: *Interpreter, expr: *const Ast.Expr) !Value {
     const binary = expr.binary;
     const left_val = try self.evaluateExprInner(binary.left);
     const right_val = try self.evaluateExprInner(binary.right);
@@ -222,7 +385,7 @@ fn binaryExpr(self: *Interpreter, expr: *Ast.Expr) !Value {
             const left = try self.cast(.number, left_val, binary.operator);
             const right = try self.cast(.number, right_val, binary.operator);
             if (right == 0.0) {
-                self.logError(Error.DivideByZero, null, binary.operator);
+                self.logError(Error.DivideByZero, binary.operator);
                 return error.LoxError;
             }
             return .{ .number = left / right };
@@ -237,8 +400,6 @@ fn binaryExpr(self: *Interpreter, expr: *Ast.Expr) !Value {
                 const right = try self.cast(.number, right_val, binary.operator);
                 return .{ .number = left + right };
             } else if (tryCast(.string, left_val)) |left| {
-                errdefer left_val.deinit(self.ctx);
-
                 const right = try self.cast(.string, right_val, binary.operator);
                 const slices = .{ left, right };
 
@@ -249,7 +410,7 @@ fn binaryExpr(self: *Interpreter, expr: *Ast.Expr) !Value {
                 return .{ .string = both };
             }
 
-            self.logError(Error.InvalidAddTypes, null, binary.operator);
+            self.logError(Error.InvalidAddTypes, binary.operator);
             return error.LoxError;
         },
         .LESS => {
