@@ -1,11 +1,16 @@
+//! All allocations go through the AST's arena, so the entire AST can be freed all at once.
+//! We may not be efficient with memory usage, but we sure make it easy to free the memory.
+
 pub const Error = error{
     UnexpectedToken,
     UnexpectedEof,
+    ExpectedOpeningParen,
     ExpectedClosingParen,
     ExpectedSemicolon,
     ExpectedIdentifier,
     ExpectedClosingCurly,
     InvalidLhs,
+    Unreachable,
 };
 
 pub const ErrorDescription = struct {
@@ -13,7 +18,6 @@ pub const ErrorDescription = struct {
     token: Scanner.Token,
 };
 
-ctx: *root.RunContext,
 arena: std.heap.ArenaAllocator,
 tokens: std.ArrayList(Scanner.Token),
 index: usize,
@@ -22,7 +26,6 @@ errors: std.ArrayList(ErrorDescription),
 /// Takes ownership of `tokens`
 pub fn init(ctx: *root.RunContext, tokens: std.ArrayList(Scanner.Token)) @This() {
     return .{
-        .ctx = ctx,
         .arena = std.heap.ArenaAllocator.init(ctx.alloc),
         .tokens = tokens,
         .index = 0,
@@ -34,12 +37,12 @@ pub fn getErrors(self: *@This()) []const ErrorDescription {
     return self.errors.items;
 }
 
-pub fn printErrors(self: *@This()) !void {
+pub fn printErrors(self: *@This(), ctx: *root.RunContext) !void {
     for (self.errors.items) |err| {
         switch (err.ty) {
             Error.UnexpectedToken => {
                 try root.report(
-                    self.ctx,
+                    ctx,
                     err.token.line,
                     "Unexpected token: `{s}`\n",
                     .{err.token.lexeme},
@@ -47,7 +50,7 @@ pub fn printErrors(self: *@This()) !void {
             },
             Error.UnexpectedEof => {
                 try root.report(
-                    self.ctx,
+                    ctx,
                     err.token.line,
                     "Unexpected EOF\n",
                     .{},
@@ -55,7 +58,7 @@ pub fn printErrors(self: *@This()) !void {
             },
             Error.ExpectedClosingParen => {
                 try root.report(
-                    self.ctx,
+                    ctx,
                     err.token.line,
                     "Expected `)` here: `{s}`\n",
                     .{err.token.lexeme},
@@ -63,7 +66,7 @@ pub fn printErrors(self: *@This()) !void {
             },
             Error.ExpectedSemicolon => {
                 try root.report(
-                    self.ctx,
+                    ctx,
                     err.token.line,
                     "Expected `;` here: `{s}`\n",
                     .{err.token.lexeme},
@@ -71,7 +74,7 @@ pub fn printErrors(self: *@This()) !void {
             },
             Error.ExpectedIdentifier => {
                 try root.report(
-                    self.ctx,
+                    ctx,
                     err.token.line,
                     "Expected identifier here: `{s}`\n",
                     .{err.token.lexeme},
@@ -79,7 +82,7 @@ pub fn printErrors(self: *@This()) !void {
             },
             Error.InvalidLhs => {
                 try root.report(
-                    self.ctx,
+                    ctx,
                     err.token.line,
                     "Invalid assignment LHS: `{s}`; expected Identifier\n",
                     .{err.token.lexeme},
@@ -87,12 +90,21 @@ pub fn printErrors(self: *@This()) !void {
             },
             Error.ExpectedClosingCurly => {
                 try root.report(
-                    self.ctx,
+                    ctx,
                     err.token.line,
                     "Expected `}}` here: `{s}`\n",
                     .{err.token.lexeme},
                 );
             },
+            Error.ExpectedOpeningParen => {
+                try root.report(
+                    ctx,
+                    err.token.line,
+                    "Expected `)` here: `{s}`\n",
+                    .{err.token.lexeme},
+                );
+            },
+            Error.Unreachable => unreachable,
         }
     }
 }
@@ -105,7 +117,7 @@ pub fn deinit(self: @This()) std.heap.ArenaAllocator {
 }
 
 pub fn parse(self: *@This()) !std.ArrayList(Ast.Stmt) {
-    var statements = std.ArrayList(Ast.Stmt).init(self.arena.allocator());
+    var statements = std.ArrayList(Ast.Stmt).init(self.allocator());
 
     while (!self.isAtEnd()) {
         const stmt_opt = self.declaration() catch |err| {
@@ -161,14 +173,117 @@ fn varStatement(self: *@This()) !Ast.Stmt {
     } else unreachable;
 }
 
-fn statement(self: *@This()) !Ast.Stmt {
+fn statement(self: *@This()) LoxAllocError!Ast.Stmt {
     // unreachable because we are only called from a method that verifies there are tokens
     const peek_token = self.peek() orelse unreachable;
     switch (peek_token.ty) {
         .PRINT => return self.printStatement(),
         .LEFT_BRACE => return self.blockStatement(),
+        .IF => return self.ifStatement(),
+        .WHILE => return self.whileStatement(),
+        .FOR => return self.forStatement(),
         else => return self.expressionStatement(),
     }
+}
+
+fn ifStatement(self: *@This()) !Ast.Stmt {
+    try self.expect(.{.IF}, Error.Unreachable);
+
+    try self.expect(.{.LEFT_PAREN}, Error.ExpectedOpeningParen);
+    const condition = try self.expression();
+    try self.expect(.{.RIGHT_PAREN}, Error.ExpectedClosingParen);
+
+    const if_block = try self.statement();
+
+    var else_block: ?*Ast.Stmt = null;
+    if (self.match(.{.ELSE})) |_| {
+        else_block = try self.alloc(try self.statement());
+    }
+
+    return .{ .if_else = .{ .condition = condition, .block = try self.alloc(if_block), .else_block = else_block } };
+}
+
+/// TODO: This thing
+fn forStatement(self: *@This()) !Ast.Stmt {
+    try self.expect(.{.FOR}, Error.Unreachable);
+
+    try self.expect(.{.LEFT_PAREN}, Error.ExpectedOpeningParen);
+
+    var initializer: ?Ast.Stmt = null;
+    if (self.peek()) |token| {
+        switch (token.ty) {
+            .SEMICOLON => {},
+            .VAR => initializer = try self.varStatement(),
+            else => initializer = try self.expressionStatement(),
+        }
+    } else {
+        try self.logError(Error.UnexpectedEof);
+        return error.LoxError;
+    }
+    // we don't need a `;` expect here because the above statement parsers already consume it
+
+    var condition: *Ast.Expr = undefined;
+    if (self.peek()) |token| {
+        condition = switch (token.ty) {
+            .SEMICOLON => try self.alloc(Ast.Expr{ .boolean = true }),
+            else => try self.expression(),
+        };
+    } else {
+        try self.logError(Error.UnexpectedEof);
+        return error.LoxError;
+    }
+    try self.expect(.{.SEMICOLON}, Error.ExpectedSemicolon);
+
+    var increment: ?*Ast.Expr = null;
+    if (self.peek()) |token| {
+        switch (token.ty) {
+            .RIGHT_PAREN => {},
+            else => increment = try self.expression(),
+        }
+    } else {
+        try self.logError(Error.UnexpectedEof);
+        return error.LoxError;
+    }
+
+    try self.expect(.{.RIGHT_PAREN}, Error.ExpectedClosingParen);
+
+    const for_block = try self.statement();
+
+    var while_block: Ast.Stmt = undefined;
+    if (increment) |cap| {
+        while_block = Ast.Stmt{ .block = std.ArrayList(Ast.Stmt).init(self.allocator()) };
+        try while_block.block.append(for_block);
+        try while_block.block.append(Ast.Stmt{ .expr = cap });
+    } else {
+        while_block = for_block;
+    }
+
+    const while_loop = Ast.Stmt{ .while_loop = .{
+        .condition = condition,
+        .block = try self.alloc(while_block),
+    } };
+
+    if (initializer) |cap| {
+        var root_block = std.ArrayList(Ast.Stmt).init(self.allocator());
+        try root_block.append(cap);
+        try root_block.append(while_loop);
+        return .{ .block = root_block };
+    } else {
+        return while_loop;
+    }
+}
+
+fn whileStatement(self: *@This()) !Ast.Stmt {
+    try self.expect(.{.WHILE}, Error.Unreachable);
+    const condition = try self.expression();
+    try self.expect(.{.RIGHT_PAREN}, Error.ExpectedSemicolon);
+
+    const while_block = try self.statement();
+
+    return .{ .while_loop = .{
+        .condition = condition,
+        .block = try self.alloc(while_block),
+    } };
 }
 
 fn blockStatement(self: *@This()) !Ast.Stmt {
@@ -176,44 +291,34 @@ fn blockStatement(self: *@This()) !Ast.Stmt {
 }
 
 fn block(self: *@This()) !std.ArrayList(Ast.Stmt) {
-    if (self.match(.{.LEFT_BRACE})) |_| {
-        var block_stmts = std.ArrayList(Ast.Stmt).init(self.arena.allocator());
+    try self.expect(.{.LEFT_BRACE}, Error.Unreachable);
+    var block_stmts = std.ArrayList(Ast.Stmt).init(self.allocator());
 
-        while (self.peek()) |peek_token| {
-            switch (peek_token.ty) {
-                .RIGHT_BRACE => break,
-                else => {
-                    if (try self.declaration()) |stmt| {
-                        try block_stmts.append(stmt);
-                    }
-                },
-            }
+    while (self.peek()) |peek_token| {
+        switch (peek_token.ty) {
+            .RIGHT_BRACE => break,
+            else => {
+                if (try self.declaration()) |stmt| {
+                    try block_stmts.append(stmt);
+                }
+            },
         }
+    }
 
-        if (self.match(.{.RIGHT_BRACE})) |_| {
-            return block_stmts;
-        }
+    try self.expect(.{.RIGHT_BRACE}, Error.ExpectedClosingCurly);
 
-        try self.logError(Error.UnexpectedEof);
-        return error.LoxError;
-    } else unreachable;
+    return block_stmts;
 }
 
 fn expectSemicolon(self: *@This()) !void {
-    if (self.match(.{.SEMICOLON})) |_| {
-        return;
-    } else {
-        try self.logError(Error.ExpectedSemicolon);
-        return error.LoxError;
-    }
+    try self.expect(.{.SEMICOLON}, Error.ExpectedSemicolon);
 }
 
 fn printStatement(self: *@This()) !Ast.Stmt {
-    if (self.match(.{.PRINT})) |_| {
-        const expr = try self.expression();
-        try self.expectSemicolon();
-        return .{ .print = expr };
-    } else unreachable;
+    try self.expect(.{.PRINT}, Error.Unreachable);
+    const expr = try self.expression();
+    try self.expectSemicolon();
+    return .{ .print = expr };
 }
 
 fn expressionStatement(self: *@This()) !Ast.Stmt {
@@ -237,8 +342,12 @@ fn logErrorToken(self: *@This(), ty: Error, token: Scanner.Token) !void {
     try self.errors.append(.{ .ty = ty, .token = token });
 }
 
+fn allocator(self: *@This()) std.mem.Allocator {
+    return self.arena.allocator();
+}
+
 fn alloc(self: *@This(), value: anytype) !*@TypeOf(value) {
-    const ptr = try self.arena.allocator().create(@TypeOf(value));
+    const ptr = try self.allocator().create(@TypeOf(value));
     ptr.* = value;
     return ptr;
 }
@@ -259,6 +368,18 @@ fn next(self: *@This()) ?Scanner.Token {
     return tok;
 }
 
+fn expect(self: *@This(), comptime types: anytype, err: Error) !void {
+    if (self.isAtEnd()) {
+        try self.logError(Error.UnexpectedEof);
+        return error.LoxError;
+    }
+
+    if (self.match(types) == null) {
+        try self.logError(err);
+        return error.LoxError;
+    }
+}
+
 // TODO: iterate these things
 fn match(self: *@This(), comptime types: anytype) ?Scanner.Token {
     const token = self.peek() orelse return null;
@@ -275,7 +396,7 @@ inline fn expression(self: *@This()) LoxAllocError!*Ast.Expr {
 }
 
 fn assignment(self: *@This()) LoxAllocError!*Ast.Expr {
-    const expr = try self.equality();
+    const expr = try self.orExpr();
 
     if (self.match(.{.EQUAL})) |equals| {
         const value = try self.assignment();
@@ -292,18 +413,42 @@ fn assignment(self: *@This()) LoxAllocError!*Ast.Expr {
     return expr;
 }
 
+fn orExpr(self: *@This()) LoxAllocError!*Ast.Expr {
+    return self.leftAssocLogicalOp(.{.OR}, andExpr);
+}
+
+fn andExpr(self: *@This()) LoxAllocError!*Ast.Expr {
+    return self.leftAssocLogicalOp(.{.AND}, equality);
+}
+
 const BinaryOpFn = *const fn (*@This()) LoxAllocError!*Ast.Expr;
 /// A helper function to reduce written code for left-associative binary operations
 inline fn leftAssocBinaryOp(
     self: *@This(),
     comptime types: anytype,
-    comptime left: BinaryOpFn,
-    comptime right: BinaryOpFn,
+    comptime parse_fn: BinaryOpFn,
 ) !*Ast.Expr {
-    var left_expr = try left(self);
+    var left_expr = try parse_fn(self);
     while (self.match(types)) |operator| {
-        const right_expr = try right(self);
+        const right_expr = try parse_fn(self);
         left_expr = try self.alloc(Ast.Expr{ .binary = .{
+            .left = left_expr,
+            .operator = operator,
+            .right = right_expr,
+        } });
+    }
+    return left_expr;
+}
+/// A helper function to reduce written code for left-associative binary operations
+inline fn leftAssocLogicalOp(
+    self: *@This(),
+    comptime types: anytype,
+    comptime parse_fn: BinaryOpFn,
+) !*Ast.Expr {
+    var left_expr = try parse_fn(self);
+    while (self.match(types)) |operator| {
+        const right_expr = try parse_fn(self);
+        left_expr = try self.alloc(Ast.Expr{ .logical = .{
             .left = left_expr,
             .operator = operator,
             .right = right_expr,
@@ -313,19 +458,19 @@ inline fn leftAssocBinaryOp(
 }
 
 fn equality(self: *@This()) LoxAllocError!*Ast.Expr {
-    return self.leftAssocBinaryOp(.{ .BANG_EQUAL, .EQUAL_EQUAL }, comparison, equality);
+    return self.leftAssocBinaryOp(.{ .BANG_EQUAL, .EQUAL_EQUAL }, comparison);
 }
 
 fn comparison(self: *@This()) LoxAllocError!*Ast.Expr {
-    return self.leftAssocBinaryOp(.{ .LESS, .GREATER, .LESS_EQUAL, .GREATER_EQUAL }, term, comparison);
+    return self.leftAssocBinaryOp(.{ .LESS, .GREATER, .LESS_EQUAL, .GREATER_EQUAL }, term);
 }
 
 fn term(self: *@This()) LoxAllocError!*Ast.Expr {
-    return self.leftAssocBinaryOp(.{ .PLUS, .MINUS }, factor, term);
+    return self.leftAssocBinaryOp(.{ .PLUS, .MINUS }, factor);
 }
 
 fn factor(self: *@This()) LoxAllocError!*Ast.Expr {
-    return self.leftAssocBinaryOp(.{ .SLASH, .STAR }, unary, factor);
+    return self.leftAssocBinaryOp(.{ .SLASH, .STAR }, unary);
 }
 
 fn unary(self: *@This()) LoxAllocError!*Ast.Expr {
@@ -367,12 +512,8 @@ fn primary(self: *@This()) LoxAllocError!*Ast.Expr {
             .LEFT_PAREN => {
                 const inner = try self.expression();
                 const ret = try self.alloc(Ast.Expr{ .grouping = inner });
-                if (self.match(.{.RIGHT_PAREN})) |_| {
-                    return ret;
-                } else {
-                    try self.logError(Error.ExpectedClosingParen);
-                    return error.LoxError;
-                }
+                try self.expect(.{.RIGHT_PAREN}, Error.ExpectedClosingParen);
+                return ret;
             },
             .IDENTIFIER => {
                 return self.alloc(Ast.Expr{ .variable = token });

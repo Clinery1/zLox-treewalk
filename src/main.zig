@@ -107,7 +107,7 @@ fn run(ctx: *RunContext, source: []const u8, prev_interpreter: ?Interpreter) !In
         const ast_inner = parser.parse() catch |err| {
             switch (err) {
                 error.LoxError => {
-                    try parser.printErrors();
+                    try parser.printErrors(ctx);
                     return error.LoxError;
                 },
                 else => return err,
@@ -119,7 +119,7 @@ fn run(ctx: *RunContext, source: []const u8, prev_interpreter: ?Interpreter) !In
     defer ast_arena.deinit();
 
     // NOTE: Debug print the AST
-    // for (ast_value.items) |stmt| {
+    // for (stmt_list.items) |stmt| {
     //     try ctx.stdout.writer().print("{s}\n", .{stmt});
     // }
 

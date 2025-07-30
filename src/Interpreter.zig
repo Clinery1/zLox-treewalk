@@ -240,6 +240,20 @@ fn evaluateStatement(self: *Interpreter, stmt: *const Ast.Stmt) !void {
                 try self.evaluateStatement(inner_stmt);
             }
         },
+        .if_else => |if_else| {
+            const val = try self.evaluateExpr(if_else.condition);
+            if (isTruthy(val)) {
+                return self.evaluateStatement(if_else.block);
+            } else if (if_else.else_block) |else_block| {
+                return self.evaluateStatement(else_block);
+            }
+        },
+        .while_loop => |while_loop| {
+            var condition = try self.evaluateExpr(while_loop.condition);
+            while (isTruthy(condition)) : (condition = try self.evaluateExpr(while_loop.condition)) {
+                try self.evaluateStatement(while_loop.block);
+            }
+        },
     }
 }
 
@@ -289,6 +303,7 @@ fn evaluateExprInner(self: *Interpreter, expr_param: *const Ast.Expr) LoxAllocEr
     while (true) {
         switch (expr.*) {
             .binary => return self.binaryExpr(expr),
+            .logical => return self.logicalExpr(expr),
             .unary => return self.unaryExpr(expr),
             .assign => return self.assignExpr(expr),
             .grouping => |inner| expr = inner,
@@ -368,6 +383,22 @@ inline fn tryCast(comptime ty: ValueType, val: Value) ?@FieldType(Value, @tagNam
         ty => |cap| return cap,
         else => return null,
     }
+}
+
+fn logicalExpr(self: *Interpreter, expr: *const Ast.Expr) !Value {
+    const logical = expr.logical;
+    const left_val = try self.evaluateExprInner(logical.left);
+    switch (logical.operator.ty) {
+        .AND => if (!isTruthy(left_val)) {
+            return left_val;
+        },
+        .OR => if (isTruthy(left_val)) {
+            return left_val;
+        },
+        else => unreachable,
+    }
+
+    return try self.evaluateExprInner(logical.right);
 }
 
 fn binaryExpr(self: *Interpreter, expr: *const Ast.Expr) !Value {
@@ -454,7 +485,7 @@ fn valueEql(left: Value, right: Value) bool {
 
 fn isTruthy(val: Value) bool {
     return switch (val) {
-        null => false,
+        .nil => false,
         .boolean => |b| b,
         else => true,
     };
