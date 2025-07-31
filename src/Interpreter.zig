@@ -207,18 +207,18 @@ fn evaluateBlockInner(self: *Interpreter, stmts: []const Ast.Stmt) !void {
 fn evaluateStatement(self: *Interpreter, stmt: *const Ast.Stmt) !void {
     switch (stmt.*) {
         .print => |expr| {
-            var val = try self.evaluateExpr(expr);
+            var val = try self.evaluateExpr(&expr);
             try self.ctx.stdout.writer().print("{s}\n", .{val});
             val.deinit(self.ctx);
         },
         .expr => |expr| {
-            var val = try self.evaluateExpr(expr);
+            var val = try self.evaluateExpr(&expr);
             val.deinit(self.ctx);
         },
         .variable => |variable| {
             var val: Value = .nil;
             if (variable.init) |var_init| {
-                val = try self.evaluateExpr(var_init);
+                val = try self.evaluateExpr(&var_init);
             }
             // std.debug.print("Define var `{s}` with value `{s}`\n", .{ variable.name.lexeme, val });
             try self.env.define(variable.name.lexeme, val);
@@ -241,7 +241,7 @@ fn evaluateStatement(self: *Interpreter, stmt: *const Ast.Stmt) !void {
             }
         },
         .if_else => |if_else| {
-            const val = try self.evaluateExpr(if_else.condition);
+            const val = try self.evaluateExpr(&if_else.condition);
             if (isTruthy(val)) {
                 return self.evaluateStatement(if_else.block);
             } else if (if_else.else_block) |else_block| {
@@ -249,8 +249,8 @@ fn evaluateStatement(self: *Interpreter, stmt: *const Ast.Stmt) !void {
             }
         },
         .while_loop => |while_loop| {
-            var condition = try self.evaluateExpr(while_loop.condition);
-            while (isTruthy(condition)) : (condition = try self.evaluateExpr(while_loop.condition)) {
+            var condition = try self.evaluateExpr(&while_loop.condition);
+            while (isTruthy(condition)) : (condition = try self.evaluateExpr(&while_loop.condition)) {
                 try self.evaluateStatement(while_loop.block);
             }
         },
@@ -307,10 +307,14 @@ fn evaluateExprInner(self: *Interpreter, expr_param: *const Ast.Expr) LoxAllocEr
             .unary => return self.unaryExpr(expr),
             .assign => return self.assignExpr(expr),
             .grouping => |inner| expr = inner,
+            .call => return self.callExpr(expr),
 
             .number, .string, .boolean, .nil, .variable => return self.literalExpr(expr),
         }
     }
+}
+
+fn callExpr(self: *Interpreter, expr: *const Ast.Expr) !Value {
 }
 
 fn assignExpr(self: *Interpreter, expr: *const Ast.Expr) !Value {

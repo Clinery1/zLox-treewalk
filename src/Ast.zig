@@ -21,6 +21,12 @@ pub const Expr = union(enum) {
 
     variable: Scanner.Token,
 
+    call: struct {
+        callee: *Expr,
+        paren: Scanner.Token,
+        arguments: std.ArrayList(Expr),
+    },
+
     number: f64,
     string: []const u8,
     boolean: bool,
@@ -85,20 +91,20 @@ pub const Expr = union(enum) {
 };
 
 pub const Stmt = union(enum) {
-    print: *Expr,
-    expr: *Expr,
+    print: Expr,
+    expr: Expr,
     variable: struct {
         name: Scanner.Token,
-        init: ?*Expr,
+        init: ?Expr,
     },
     block: std.ArrayList(Stmt),
     if_else: struct {
-        condition: *Expr,
+        condition: Expr,
         block: *Stmt,
         else_block: ?*Stmt,
     },
     while_loop: struct {
-        condition: *Expr,
+        condition: Expr,
         block: *Stmt,
     },
 

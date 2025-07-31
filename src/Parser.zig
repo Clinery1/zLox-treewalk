@@ -11,6 +11,7 @@ pub const Error = error{
     ExpectedClosingCurly,
     InvalidLhs,
     Unreachable,
+    TooManyArgs,
 };
 
 pub const ErrorDescription = struct {
@@ -200,7 +201,11 @@ fn ifStatement(self: *@This()) !Ast.Stmt {
         else_block = try self.alloc(try self.statement());
     }
 
-    return .{ .if_else = .{ .condition = condition, .block = try self.alloc(if_block), .else_block = else_block } };
+    return .{ .if_else = .{
+        .condition = condition,
+        .block = try self.alloc(if_block),
+        .else_block = else_block,
+    } };
 }
 
 /// TODO: This thing
@@ -222,19 +227,19 @@ fn forStatement(self: *@This()) !Ast.Stmt {
     }
     // we don't need a `;` expect here because the above statement parsers already consume it
 
-    var condition: *Ast.Expr = undefined;
+    var condition = Ast.Expr{ .boolean = true };
     if (self.peek()) |token| {
-        condition = switch (token.ty) {
-            .SEMICOLON => try self.alloc(Ast.Expr{ .boolean = true }),
-            else => try self.expression(),
-        };
+        switch (token.ty) {
+            .SEMICOLON => {},
+            else => condition = try self.expression(),
+        }
     } else {
         try self.logError(Error.UnexpectedEof);
         return error.LoxError;
     }
     try self.expect(.{.SEMICOLON}, Error.ExpectedSemicolon);
 
-    var increment: ?*Ast.Expr = null;
+    var increment: ?Ast.Expr = null;
     if (self.peek()) |token| {
         switch (token.ty) {
             .RIGHT_PAREN => {},
@@ -380,7 +385,6 @@ fn expect(self: *@This(), comptime types: anytype, err: Error) !void {
     }
 }
 
-// TODO: iterate these things
 fn match(self: *@This(), comptime types: anytype) ?Scanner.Token {
     const token = self.peek() orelse return null;
     inline for (types) |ty| {
@@ -391,18 +395,31 @@ fn match(self: *@This(), comptime types: anytype) ?Scanner.Token {
     return null;
 }
 
-inline fn expression(self: *@This()) LoxAllocError!*Ast.Expr {
+fn check(self: *@This(), comptime types: anytype) bool {
+    const token = self.peek() orelse return null;
+    inline for (types) |ty| {
+        if (ty == token.ty) {
+            return true;
+        }
+    }
+    return false;
+}
+
+inline fn expression(self: *@This()) LoxAllocError!Ast.Expr {
     return self.assignment();
 }
 
-fn assignment(self: *@This()) LoxAllocError!*Ast.Expr {
+fn assignment(self: *@This()) LoxAllocError!Ast.Expr {
     const expr = try self.orExpr();
 
     if (self.match(.{.EQUAL})) |equals| {
         const value = try self.assignment();
-        switch (expr.*) {
+        switch (expr) {
             .variable => |name| {
-                return self.alloc(Ast.Expr{ .assign = .{ .name = name, .value = value } });
+                return .{ .assign = .{
+                    .name = name,
+                    .value = try self.alloc(value),
+                } };
             },
             else => {
                 try self.logErrorToken(Error.InvalidLhs, equals);
@@ -413,29 +430,29 @@ fn assignment(self: *@This()) LoxAllocError!*Ast.Expr {
     return expr;
 }
 
-fn orExpr(self: *@This()) LoxAllocError!*Ast.Expr {
+fn orExpr(self: *@This()) LoxAllocError!Ast.Expr {
     return self.leftAssocLogicalOp(.{.OR}, andExpr);
 }
 
-fn andExpr(self: *@This()) LoxAllocError!*Ast.Expr {
+fn andExpr(self: *@This()) LoxAllocError!Ast.Expr {
     return self.leftAssocLogicalOp(.{.AND}, equality);
 }
 
-const BinaryOpFn = *const fn (*@This()) LoxAllocError!*Ast.Expr;
+const BinaryOpFn = *const fn (*@This()) LoxAllocError!Ast.Expr;
 /// A helper function to reduce written code for left-associative binary operations
 inline fn leftAssocBinaryOp(
     self: *@This(),
     comptime types: anytype,
     comptime parse_fn: BinaryOpFn,
-) !*Ast.Expr {
+) !Ast.Expr {
     var left_expr = try parse_fn(self);
     while (self.match(types)) |operator| {
         const right_expr = try parse_fn(self);
-        left_expr = try self.alloc(Ast.Expr{ .binary = .{
-            .left = left_expr,
+        left_expr = .{ .binary = .{
+            .left = try self.alloc(left_expr),
             .operator = operator,
-            .right = right_expr,
-        } });
+            .right = try self.alloc(right_expr),
+        } };
     }
     return left_expr;
 }
@@ -444,45 +461,100 @@ inline fn leftAssocLogicalOp(
     self: *@This(),
     comptime types: anytype,
     comptime parse_fn: BinaryOpFn,
-) !*Ast.Expr {
+) !Ast.Expr {
     var left_expr = try parse_fn(self);
     while (self.match(types)) |operator| {
         const right_expr = try parse_fn(self);
-        left_expr = try self.alloc(Ast.Expr{ .logical = .{
-            .left = left_expr,
+        left_expr = .{ .logical = .{
+            .left = try self.alloc(left_expr),
             .operator = operator,
-            .right = right_expr,
-        } });
+            .right = try self.alloc(right_expr),
+        } };
     }
     return left_expr;
 }
 
-fn equality(self: *@This()) LoxAllocError!*Ast.Expr {
+fn equality(self: *@This()) LoxAllocError!Ast.Expr {
     return self.leftAssocBinaryOp(.{ .BANG_EQUAL, .EQUAL_EQUAL }, comparison);
 }
 
-fn comparison(self: *@This()) LoxAllocError!*Ast.Expr {
+fn comparison(self: *@This()) LoxAllocError!Ast.Expr {
     return self.leftAssocBinaryOp(.{ .LESS, .GREATER, .LESS_EQUAL, .GREATER_EQUAL }, term);
 }
 
-fn term(self: *@This()) LoxAllocError!*Ast.Expr {
+fn term(self: *@This()) LoxAllocError!Ast.Expr {
     return self.leftAssocBinaryOp(.{ .PLUS, .MINUS }, factor);
 }
 
-fn factor(self: *@This()) LoxAllocError!*Ast.Expr {
+fn factor(self: *@This()) LoxAllocError!Ast.Expr {
     return self.leftAssocBinaryOp(.{ .SLASH, .STAR }, unary);
 }
 
-fn unary(self: *@This()) LoxAllocError!*Ast.Expr {
+fn unary(self: *@This()) LoxAllocError!Ast.Expr {
     if (self.match(.{ .MINUS, .BANG })) |operator| {
         const right = try self.unary();
-        return self.alloc(Ast.Expr{ .unary = .{ .operator = operator, .right = right } });
+        return .{ .unary = .{
+            .operator = operator,
+            .right = try self.alloc(right),
+        } };
     } else {
         return self.primary();
     }
 }
 
-fn primary(self: *@This()) LoxAllocError!*Ast.Expr {
+fn call(self: *@This()) LoxAllocError!Ast.Expr {
+    var expr = try self.primary();
+
+    while (true) {
+        if (self.match(.{.LEFT_PAREN})) |_| {
+            expr = self.finishCall(expr);
+        } else {
+            break;
+        }
+    }
+
+    return expr;
+}
+
+fn finishCall(self: *@This(), callee: Ast.Expr) LoxAllocError!Ast.Expr {
+    // we don't have to worry about freeing this on error because we are storing it in an arena that
+    // we free all at once
+    var args = std.ArrayList(Ast.Expr).init(self.allocator());
+
+    if (!self.check(.{.RIGHT_PAREN})) {
+        while (true) {
+            const token = self.peek();
+            args.append(try self.expression());
+
+            if (args.items.len == 256) {
+                try self.logErrorToken(Error.TooManyArgs, token.?);
+            }
+
+            if (self.match(.COMMA)) |_| {
+                continue;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if (self.match(.{.RIGHT_PAREN})) |paren| {
+        if (args.items.len >= 255) {
+            try self.logErrorToken(Error.TooManyArgs, paren);
+        }
+
+        return .{ .call = .{
+            .callee = try self.alloc(callee),
+            .paren = paren,
+            .arguments = args,
+        } };
+    } else {
+        try self.logError(Error.ExpectedClosingParen);
+        return error.LoxError;
+    }
+}
+
+fn primary(self: *@This()) LoxAllocError!Ast.Expr {
     if (self.next()) |token| {
         switch (token.ty) {
             .NUMBER => {
@@ -490,33 +562,32 @@ fn primary(self: *@This()) LoxAllocError!*Ast.Expr {
                 // Some(literal) and Literal.number
                 const lit = token.literal orelse unreachable;
                 const num = lit.number;
-                return self.alloc(Ast.Expr{ .number = num });
+                return .{ .number = num };
             },
             .STRING => {
                 // SAFETY: We know based on the scanner code that these are guaranteed to be
                 // Some(literal) and Literal.number
                 const lit = token.literal orelse unreachable;
                 const string = lit.string;
-                return self.alloc(Ast.Expr{ .string = string });
+                return .{ .string = string };
             },
             .NIL => {
                 const ret: Ast.Expr = .nil;
-                return self.alloc(ret);
+                return ret;
             },
             .TRUE => {
-                return self.alloc(Ast.Expr{ .boolean = true });
+                return .{ .boolean = true };
             },
             .FALSE => {
-                return self.alloc(Ast.Expr{ .boolean = false });
+                return .{ .boolean = false };
             },
             .LEFT_PAREN => {
                 const inner = try self.expression();
-                const ret = try self.alloc(Ast.Expr{ .grouping = inner });
                 try self.expect(.{.RIGHT_PAREN}, Error.ExpectedClosingParen);
-                return ret;
+                return .{ .grouping = try self.alloc(inner) };
             },
             .IDENTIFIER => {
-                return self.alloc(Ast.Expr{ .variable = token });
+                return .{ .variable = token };
             },
             else => {
                 try self.logError(Error.UnexpectedToken);
