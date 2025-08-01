@@ -105,6 +105,14 @@ pub fn printErrors(self: *@This(), ctx: *root.RunContext) !void {
                     .{err.token.lexeme},
                 );
             },
+            Error.TooManyArgs => {
+                try root.report(
+                    ctx,
+                    err.token.line,
+                    "Too many arguments for function call! Only 255 are supported.\n",
+                    .{},
+                );
+            },
             Error.Unreachable => unreachable,
         }
     }
@@ -396,7 +404,7 @@ fn match(self: *@This(), comptime types: anytype) ?Scanner.Token {
 }
 
 fn check(self: *@This(), comptime types: anytype) bool {
-    const token = self.peek() orelse return null;
+    const token = self.peek() orelse return false;
     inline for (types) |ty| {
         if (ty == token.ty) {
             return true;
@@ -498,7 +506,7 @@ fn unary(self: *@This()) LoxAllocError!Ast.Expr {
             .right = try self.alloc(right),
         } };
     } else {
-        return self.primary();
+        return self.call();
     }
 }
 
@@ -507,7 +515,7 @@ fn call(self: *@This()) LoxAllocError!Ast.Expr {
 
     while (true) {
         if (self.match(.{.LEFT_PAREN})) |_| {
-            expr = self.finishCall(expr);
+            expr = try self.finishCall(expr);
         } else {
             break;
         }
@@ -524,13 +532,13 @@ fn finishCall(self: *@This(), callee: Ast.Expr) LoxAllocError!Ast.Expr {
     if (!self.check(.{.RIGHT_PAREN})) {
         while (true) {
             const token = self.peek();
-            args.append(try self.expression());
+            try args.append(try self.expression());
 
             if (args.items.len == 256) {
                 try self.logErrorToken(Error.TooManyArgs, token.?);
             }
 
-            if (self.match(.COMMA)) |_| {
+            if (self.match(.{.COMMA})) |_| {
                 continue;
             } else {
                 break;

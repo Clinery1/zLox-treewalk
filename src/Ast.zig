@@ -67,19 +67,19 @@ pub const Expr = union(enum) {
         _ = options;
         switch (self) {
             .binary => |binary| {
-                try writer.print("({s} {s} {s})", .{ binary.operator.lexeme, binary.left, binary.right });
+                try writer.print("{s} {s} {s}", .{ binary.left, binary.operator.lexeme, binary.right });
             },
             .logical => |logical| {
-                try writer.print("({s} {s} {s})", .{ logical.operator.lexeme, logical.left, logical.right });
+                try writer.print("{s} {s} {s}", .{ logical.left, logical.operator.lexeme, logical.right });
             },
             .unary => |unary| {
-                try writer.print("({s} {s}", .{ unary.operator.lexeme, unary.right });
+                try writer.print("{s}{s}", .{ unary.operator.lexeme, unary.right });
             },
             .grouping => |grouping| {
-                try writer.print("(group {s})", .{grouping});
+                try writer.print("({s})", .{grouping});
             },
             .assign => |assign| {
-                try writer.print("(assign {s} {s})", .{ assign.name.lexeme, assign.value });
+                try writer.print("({s} = {s})", .{ assign.name.lexeme, assign.value });
             },
             .variable => |token| try writer.print("{s}", .{token.lexeme}),
             .number => |number| try writer.print("{d}", .{number}),
@@ -88,6 +88,12 @@ pub const Expr = union(enum) {
             .nil => try writer.writeAll("nil"),
         }
     }
+};
+
+pub const Function = struct {
+    name: Scanner.Token,
+    params: std.ArrayList(Scanner.Token),
+    body: std.ArrayList(Stmt),
 };
 
 pub const Stmt = union(enum) {
@@ -107,6 +113,7 @@ pub const Stmt = union(enum) {
         condition: Expr,
         block: *Stmt,
     },
+    function: Function,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self) {
@@ -140,6 +147,57 @@ pub const Stmt = union(enum) {
                 while_loop.block.deinit(alloc);
                 alloc.destroy(while_loop.block);
             },
+            .function => |function| {
+                function.params.deinit();
+                for (function.body.items) |stmt| {
+                    stmt.deinit(alloc);
+                }
+                function.body.deinit();
+            },
+        }
+    }
+
+    pub fn printCode(self: *@This(), writer: anytype) !void {
+        try self.printInner(writer, 0);
+    }
+
+    inline fn printInnerLeftPad(writer: anytype, level: 0) !void {
+        var i = 0;
+        while (i < level) : (i += 1) {
+            try writer.writeAll("    ");
+        }
+    }
+
+    fn printInner(self: *@This(), writer: anytype, level: 0) !void {
+        switch (self) {
+            .print => |expr| try writer.print("print {s};\n", .{expr}),
+            .expr => |expr| try writer.print("{s};\n", .{expr}),
+            .variable => |variable| if (variable.init) |init| {
+                try writer.print("var {s} = {s};\n", .{ variable.name.lexeme, init });
+            } else {
+                try writer.print("var {s};\n", .{variable.name.lexeme});
+            },
+            .block => |block| {
+                try writer.writeAll("{\n");
+                for (block.items) |item| {
+                    try printInnerLeftPad(writer, level + 1);
+                    try item.printInner(writer, level + 1);
+                }
+                try printInnerLeftPad(writer, level);
+                try writer.writeAll("}\n");
+            },
+            .if_else => |if_else| {
+                try writer.print("if {s} ", .{if_else.condition});
+                try if_else.block.printInner(writer, level + 1);
+                if (if_else.else_block) |block| {
+                    try printInnerLeftPad(writer, level);
+                    try writer.writeAll("else ");
+                    try block.printInner(writer, level + 1);
+                }
+            },
+            .while_loop => |while_loop| {
+                try writer.print("while {s} {s}", .{ while_loop.condition, while_loop.block });
+            },
         }
     }
 
@@ -151,33 +209,7 @@ pub const Stmt = union(enum) {
     ) !void {
         _ = fmt;
         _ = options;
-
-        switch (self) {
-            .print => |expr| try writer.print("(print {s})\n", .{expr}),
-            .expr => |expr| try writer.print("(exprStmt {s})\n", .{expr}),
-            .variable => |variable| if (variable.init) |init| {
-                try writer.print("(var {s} {s})\n", .{ variable.name.lexeme, init });
-            } else {
-                try writer.print("(var {s})\n", .{variable.name.lexeme});
-            },
-            .block => |block| {
-                try writer.writeAll("(block\n");
-                for (block.items) |item| {
-                    try writer.print("{s}", .{item});
-                }
-                try writer.writeAll(")\n");
-            },
-            .if_else => |if_else| {
-                try writer.print("(if {s} {s}", .{ if_else.condition, if_else.block });
-                if (if_else.else_block) |block| {
-                    try writer.print(" else {s}", .{block});
-                }
-                try writer.writeAll(")\n");
-            },
-            .while_loop => |while_loop| {
-                try writer.print("(while {s} {s})\n", .{ while_loop.condition, while_loop.block });
-            },
-        }
+        try self.printInner(writer, 0);
     }
 };
 

@@ -5,6 +5,7 @@
 - Chapter 7: Evaluating Expressions
 - Chapter 8: Statements and State
 - Chapter 9: Control Flow
+- Partial Chapter 10. See below for why.
 
 # Description
 This is zLox! A Zig-based implementation of
@@ -41,6 +42,16 @@ One major example are expression intermediate values. These are actually allocat
 (if needed e.g., strings). The final result of the expression computation is then reallocated with
 the program "global" allocator to be used elsewhere (or immediately discarded) and the arena is
 cleared.
+
+
+# A note about Chapter 10
+Due to my low skill level in manually managing memory, I kind of backed myself in a corner with the
+environments and LoxFunctions. I got native functions working, but couldn't figure out how I could
+store the environment and NOT have it leak when we inevitably just discard the value. This is why we
+should have a garbage collector. I am sure I can figure it out later, but I am just not in the
+headspace to figure it out right now, so this project is being abandoned in favor of cLox.
+
+I will still be reading the rest of jLox again, but moving to implementing cLox.
 
 
 # List of differences to the book

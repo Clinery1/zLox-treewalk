@@ -1,6 +1,23 @@
 const Interpreter = @This();
 
-pub const ValueType = enum { boolean, number, string, nil };
+pub const ValueType = enum { boolean, number, string, function, nil };
+
+pub const LoxCallable = struct {
+    data: *anyopaque,
+    /// Impose a reasonable hard limit of 65,535 args. I think thats plenty.
+    args: u16,
+    call: *const fn (
+        *anyopaque,
+        interpreter: *Interpreter,
+        args: []Value,
+        source_token: Scanner.Token,
+    ) LoxAllocError!Value,
+};
+
+pub const LoxFunction = struct {
+    function: Ast.Function,
+    env: Environment,
+};
 
 pub const Value = union(ValueType) {
     boolean: bool,
@@ -8,11 +25,14 @@ pub const Value = union(ValueType) {
     /// Strings are owned by the value, so when the value goes out of scope they need to be
     /// deallocated.
     string: []u8,
+    function: LoxCallable,
+    lox_function: LoxFunction,
     nil,
 
     pub fn deinit(self: *@This(), ctx: *root.RunContext) void {
         switch (self.*) {
             .string => |slice| ctx.alloc.free(slice),
+            .lox_function => |function| function.env.deinit(),
             else => {},
         }
     }
@@ -31,70 +51,113 @@ pub const Value = union(ValueType) {
             .number => |val| writer.print("{d}", .{val}),
             .string => |val| writer.print("{s}", .{val}),
             .nil => writer.writeAll("nil"),
+            .function => writer.writeAll("<nativeFn>"),
+            .lox_function => writer.writeAll("<fn>"),
         };
     }
 };
 
+/// A ref-counted environment variable. As such, it stores a pointer to a heap-allocated box that
+/// holds the actual env data. This means we just pass the Environment by value.
 pub const Environment = struct {
-    ctx: *root.RunContext,
-    next: ?*@This(),
-    values: std.StringHashMap(Value),
+    const Inner = struct {
+        ctx: *root.RunContext,
+        next: ?Environment,
+        values: std.StringHashMap(Value),
+        refs: usize,
+    };
 
-    pub fn init(ctx: *root.RunContext) !*@This() {
-        const ptr = try ctx.alloc.create(@This());
+    inner: *Inner,
+
+    pub fn init(ctx: *root.RunContext) !@This() {
+        const ptr = try ctx.alloc.create(Inner);
         ptr.* = .{
             .ctx = ctx,
             .next = null,
             .values = std.StringHashMap(Value).init(ctx.alloc),
+            .refs = 1,
         };
-        return ptr;
+        return .{ .inner = ptr };
     }
 
-    pub fn initChild(ctx: *root.RunContext, parent: *@This()) !*@This() {
-        const ptr = try ctx.alloc.create(@This());
+    pub fn initChild(ctx: *root.RunContext, parent: @This()) !@This() {
+        const ptr = try ctx.alloc.create(Inner);
+        parent.inner.refs += 1;
         ptr.* = .{
             .ctx = ctx,
             .next = parent,
             .values = std.StringHashMap(Value).init(ctx.alloc),
+            .refs = 1,
         };
-        return ptr;
+        return .{ .inner = ptr };
     }
 
-    pub fn deinit(self: *@This()) void {
-        var iter = self.values.iterator();
-        while (iter.next()) |kv| {
-            kv.value_ptr.deinit(self.ctx);
-            self.ctx.alloc.free(kv.key_ptr.*);
-        }
-        self.values.deinit();
-        if (self.next) |next| {
+    /// A simple ref-count increment. Use Environment.deinit() to decrement the ref count
+    pub fn copy(self: @This()) @This() {
+        self.inner.refs += 1;
+        return self;
+    }
+
+    /// Clone the values stored in `self` and return a new Environment
+    pub fn clone(self: @This()) !@This() {
+        const values = try self.inner.values.clone();
+        const ptr = try ctx.alloc.create(Inner);
+        parent.inner.refs += 1;
+        ptr.* = .{
+            .ctx = ctx,
+            .next = parent,
+            .values = std.StringHashMap(Value).init(ctx.alloc),
+            .refs = 1,
+        };
+        return .{ .inner = ptr };
+    }
+
+    pub fn deinit(self: @This()) void {
+        self.inner.refs -= 1;
+        if (self.inner.next) |next| {
             next.deinit();
-            self.ctx.alloc.destroy(next);
+        }
+
+        if (self.inner.refs == 0) {
+            const ctx = self.inner.ctx;
+            var iter = self.inner.values.iterator();
+            while (iter.next()) |kv| {
+                kv.value_ptr.deinit(self.inner.ctx);
+                self.inner.ctx.alloc.free(kv.key_ptr.*);
+            }
+            self.inner.values.deinit();
+            ctx.alloc.destroy(self.inner);
         }
     }
 
     /// NOTE: Value **must** be allocated by the program allocator, not the Expr Arena. Copies the
     /// key value to an owned allocation.
-    pub fn define(self: *@This(), string: []const u8, value: Value) !void {
-        const ptr = try self.ctx.alloc.alloc(u8, string.len);
+    pub fn define(self: @This(), string: []const u8, value: Value) !void {
+        const ptr = try self.inner.ctx.alloc.alloc(u8, string.len);
         std.mem.copyForwards(u8, ptr, string);
 
-        if (self.values.fetchRemove(ptr)) |kv| {
-            self.ctx.alloc.free(kv.key);
-            var val = kv.value;
-            val.deinit(self.ctx);
+        switch (value) {
+            .lox_function => |function| {
+                function.env.inner.refs += 1;
+            },
         }
 
-        try self.values.put(ptr, value);
+        if (self.inner.values.fetchRemove(ptr)) |kv| {
+            self.inner.ctx.alloc.free(kv.key);
+            var val = kv.value;
+            val.deinit(self.inner.ctx);
+        }
+
+        try self.inner.values.put(ptr, value);
     }
 
     /// NOTE: Value **must** be allocated by the program allocator, not the Expr Arena. Copies the
     /// key value to an owned allocation.
-    pub fn assign(self: *@This(), string: []const u8, value: Value) Error!void {
-        if (self.values.getPtr(string)) |stored_val| {
-            stored_val.deinit(self.ctx);
+    pub fn assign(self: @This(), string: []const u8, value: Value) Error!void {
+        if (self.inner.values.getPtr(string)) |stored_val| {
+            stored_val.deinit(self.inner.ctx);
             stored_val.* = value;
-        } else if (self.next) |next| {
+        } else if (self.inner.next) |next| {
             return next.assign(string, value);
         } else {
             return Error.UndefinedVariable;
@@ -103,10 +166,10 @@ pub const Environment = struct {
 
     /// NOTE: Returns a copy of the internal value. This environment still owns it, so just discard
     /// the value when finished.
-    pub fn get(self: *@This(), string: []const u8) Error!Value {
-        if (self.values.get(string)) |val| {
+    pub fn get(self: @This(), string: []const u8) Error!Value {
+        if (self.inner.values.get(string)) |val| {
             return val;
-        } else if (self.next) |next| {
+        } else if (self.inner.next) |next| {
             return next.get(string);
         }
         return Error.UndefinedVariable;
@@ -118,6 +181,9 @@ pub const Error = error{
     InvalidAddTypes,
     DivideByZero,
     UndefinedVariable,
+    NotCallable,
+    TooManyArgs,
+    NotEnoughArgs,
 };
 
 pub const ErrorDescription = struct {
@@ -128,20 +194,29 @@ pub const ErrorDescription = struct {
 ctx: *root.RunContext,
 error_desc: ?ErrorDescription,
 expr_arena: std.heap.ArenaAllocator,
-env: *Environment,
+env: Environment,
+globals: Environment,
 
 pub fn init(ctx: *root.RunContext) !Interpreter {
+    var env = try Environment.init(ctx);
+
+    // Define builtins. This is really quite a lot more than I need for Lox, but I can, so I will!
+    inline for (builtins.exports) |builtin| {
+        try env.define(builtin.name, .{ .function = builtin.callable });
+    }
+
     return .{
         .ctx = ctx,
         .error_desc = null,
         .expr_arena = std.heap.ArenaAllocator.init(ctx.alloc),
-        .env = try Environment.init(ctx),
+        .env = env.copy(),
+        .globals = env,
     };
 }
 
 pub fn deinit(self: *Interpreter) void {
     self.env.deinit();
-    self.ctx.alloc.destroy(self.env);
+    self.globals.deinit();
     self.expr_arena.deinit();
 }
 
@@ -193,6 +268,36 @@ pub fn printError(self: *Interpreter) !void {
                     try writer.writeAll("Variable is undefined\n");
                 }
             },
+            Error.NotCallable => {
+                if (err.token) |token| {
+                    try writer.print(
+                        "[{d}] Type is not callable\n",
+                        .{token.line},
+                    );
+                } else {
+                    try writer.writeAll("Too many args to function\n");
+                }
+            },
+            Error.TooManyArgs => {
+                if (err.token) |token| {
+                    try writer.print(
+                        "[{d}] Too many args for function\n",
+                        .{token.line},
+                    );
+                } else {
+                    try writer.writeAll("Too many args for function\n");
+                }
+            },
+            Error.NotEnoughArgs => {
+                if (err.token) |token| {
+                    try writer.print(
+                        "[{d}] Not enough args for function\n",
+                        .{token.line},
+                    );
+                } else {
+                    try writer.writeAll("Not enough args for function\n");
+                }
+            },
         }
     }
     self.error_desc = null;
@@ -225,15 +330,13 @@ fn evaluateStatement(self: *Interpreter, stmt: *const Ast.Stmt) !void {
         },
         .block => |block| {
             const old_env = self.env;
-            const new_env = try Environment.initChild(self.ctx, old_env);
-            self.env = new_env;
+            self.env = try Environment.initChild(self.ctx, old_env);
             // release the environment on success or error. Defer is really nice.
             defer {
+                const new_env = self.env;
                 self.env = old_env;
 
-                new_env.next = null;
                 new_env.deinit();
-                self.ctx.alloc.destroy(new_env);
             }
 
             for (block.items) |*inner_stmt| {
@@ -254,38 +357,50 @@ fn evaluateStatement(self: *Interpreter, stmt: *const Ast.Stmt) !void {
                 try self.evaluateStatement(while_loop.block);
             }
         },
+        .function => |function| {
+            const callable = .{.data = 
+        },
     }
+}
+
+fn evaluateFunction(
+    function: *Ast.Function,
+    self: *Interpreter,
+    args: []Value,
+    token: Scanner.Token,
+) LoxAllocError!Value {
+    _ = function;
+    _ = self;
+    _ = args;
+    _ = token;
 }
 
 fn logError(self: *Interpreter, ty: Error, token: ?Scanner.Token) void {
     self.error_desc = .{ .ty = ty, .token = token };
 }
 
-fn allocValue(self: *Interpreter, val: Value) !*Value {
-    const ptr = try self.ctx.alloc.create(Value);
-    ptr.* = val;
-    return ptr;
-}
-
 /// If the value has an allocation, then it reallocates it in the program allocator. This bypasses
 /// the resetting of the expression allocator
 fn reallocValue(self: *Interpreter, val: Value) !Value {
-    if (std.meta.activeTag(val) == .string) {
-        const ptr = try self.allocString(val.string);
-        return .{ .string = ptr };
-    } else {
-        return val;
+    return reallocValueIn(val, self.ctx.alloc);
+}
+
+fn reallocValueIn(val: Value, alloc: std.mem.Allocator) !Value {
+    switch (val) {
+        .string => |string| {
+            const ptr = try allocStringIn(string, alloc);
+            return .{ .string = ptr };
+        },
+        else => return val,
     }
 }
 
 fn exprAllocString(self: *Interpreter, string: []const u8) ![]u8 {
-    const ptr = try self.expr_arena.allocator().alloc(u8, string.len);
-    std.mem.copyForwards(u8, ptr, string);
-    return ptr;
+    return allocStringIn(string, self.expr_arena.allocator());
 }
 
-fn allocString(self: *Interpreter, string: []const u8) ![]u8 {
-    const ptr = try self.ctx.alloc.alloc(u8, string.len);
+fn allocStringIn(string: []const u8, alloc: std.mem.Allocator) ![]u8 {
+    const ptr = try alloc.alloc(u8, string.len);
     std.mem.copyForwards(u8, ptr, string);
     return ptr;
 }
@@ -315,6 +430,43 @@ fn evaluateExprInner(self: *Interpreter, expr_param: *const Ast.Expr) LoxAllocEr
 }
 
 fn callExpr(self: *Interpreter, expr: *const Ast.Expr) !Value {
+    const callable = expr.call;
+    var callArena = std.heap.ArenaAllocator.init(self.ctx.alloc);
+    defer callArena.deinit();
+    const callee = try reallocValueIn(
+        try self.evaluateExprInner(callable.callee),
+        callArena.allocator(),
+    );
+
+    var arguments = std.ArrayList(Value).init(callArena.allocator());
+    for (callable.arguments.items) |*arg| {
+        const val = try reallocValueIn(
+            try self.evaluateExprInner(arg),
+            callArena.allocator(),
+        );
+        try arguments.append(val);
+    }
+    switch (callee) {
+        .function => |function| {
+            return self.call(function, arguments.items, callable.paren);
+        },
+        else => {
+            self.logError(Error.NotCallable, callable.paren);
+            return error.LoxError;
+        },
+    }
+}
+
+fn call(self: *Interpreter, callable: LoxCallable, arguments: []Value, token: Scanner.Token) LoxAllocError!Value {
+    if (arguments.len == callable.args) {
+        return callable.call(callable.data, self, arguments, token);
+    } else if (arguments.len > callable.args) {
+        self.logError(Error.TooManyArgs, token);
+        return error.LoxError;
+    } else {
+        self.logError(Error.NotEnoughArgs, token);
+        return error.LoxError;
+    }
 }
 
 fn assignExpr(self: *Interpreter, expr: *const Ast.Expr) !Value {
@@ -481,6 +633,7 @@ fn valueEql(left: Value, right: Value) bool {
             .boolean => |left_bool| return left_bool == right.boolean,
             .string => |left_str| return std.mem.eql(u8, left_str, right.string),
             .nil => return true,
+            .function => |left_callable| return @intFromPtr(left_callable.call) == @intFromPtr(right.function.call),
         }
     } else {
         return false;
@@ -497,6 +650,7 @@ fn isTruthy(val: Value) bool {
 
 const root = @import("root");
 const std = @import("std");
+const builtins = @import("builtins.zig");
 
 const Ast = root.Ast;
 const Scanner = root.Scanner;
